@@ -22,7 +22,7 @@ WS_PORT = config.get("websocket_port", 8765)
 
 client_connections = {}  # client_id => websocket
 port_client_map = {}     # remote_port => client_id
-channels = {}            # channel_id => (writer, websocket)
+channels = {}            # channel_id => (writer, websocket, remote_port)
 
 async def register_client(websocket):
     try:
@@ -56,13 +56,13 @@ async def listen_from_client(websocket, client_id):
             if type_ == "data":
                 payload = base64.b64decode(data["payload"])
                 if channel_id in channels:
-                    writer, _ = channels[channel_id]
+                    writer, _, _ = channels[channel_id]
                     writer.write(payload)
                     await writer.drain()
 
             elif type_ == "close":
                 if channel_id in channels:
-                    writer, _ = channels[channel_id]
+                    writer, _, _ = channels[channel_id]
                     writer.close()
                     del channels[channel_id]
 
@@ -81,7 +81,15 @@ async def handle_tcp_connection(remote_port, reader, writer):
         return
 
     channel_id = f"{client_id}:{id(writer)}"
-    channels[channel_id] = (writer, websocket)
+    channels[channel_id] = (writer, websocket, remote_port)
+    print(f"[建立连接] 通道 {channel_id} 端口 {remote_port}")
+
+    # 发送连接建立通知给客户端，包含远程端口信息
+    await websocket.send(json.dumps({
+        "channel": channel_id,
+        "type": "connect",
+        "remote_port": remote_port
+    }))
 
     async def tcp_to_ws():
         try:
@@ -103,6 +111,7 @@ async def handle_tcp_connection(remote_port, reader, writer):
             }))
             channels.pop(channel_id, None)
             writer.close()
+            print(f"[关闭连接] 通道 {channel_id}")
 
     asyncio.create_task(tcp_to_ws())
 

@@ -22,10 +22,19 @@ MAPPINGS = config["mappings"]
 
 # ===========================
 
+# 创建端口映射表
 local_map = {
     m["remote_port"]: (m["local_ip"], m["local_port"]) for m in MAPPINGS
 }
+# 存储通道连接
 channel_map = {}
+# 存储通道到远程端口的映射
+channel_port_map = {}
+
+# 创建反向映射表，记录每个远程端口对应的映射
+remote_port_lookup = {}
+for m in MAPPINGS:
+    remote_port_lookup[m["remote_port"]] = (m["local_ip"], m["local_port"])
 
 async def handle_client():
     while True:
@@ -57,26 +66,55 @@ async def read_from_server(ws):
         channel_id = data["channel"]
         type_ = data["type"]
 
-        if type_ == "data":
+        if type_ == "connect":
+            # 处理新连接建立
+            remote_port = data["remote_port"]
+            channel_port_map[channel_id] = remote_port
+            local_ip, local_port = local_map[remote_port]
+            
+            try:
+                print(f"[收到连接] 远程端口 {remote_port} -> 本地 {local_ip}:{local_port}")
+                reader, writer = await asyncio.open_connection(local_ip, local_port)
+                channel_map[channel_id] = (reader, writer)
+                
+                # 启动从本地到WebSocket的转发任务
+                asyncio.create_task(forward_local_to_ws(reader, ws, channel_id))
+                print(f"[已建立] 通道 {channel_id} 连接到 {local_ip}:{local_port}")
+            except Exception as e:
+                print(f"[连接失败] 无法连接到 {local_ip}:{local_port}: {e}")
+
+        elif type_ == "data":
             payload = base64.b64decode(data["payload"])
 
             if channel_id not in channel_map:
-                remote_port = int(channel_id.split(":")[1])
-                local_ip, local_port = local_map[remote_port]
-                reader, writer = await asyncio.open_connection(local_ip, local_port)
-                channel_map[channel_id] = (reader, writer)
+                if channel_id in channel_port_map:
+                    # 已知远程端口，但连接断开，尝试重连
+                    remote_port = channel_port_map[channel_id]
+                    local_ip, local_port = local_map[remote_port]
+                    try:
+                        print(f"[重新连接] 远程端口 {remote_port} -> 本地 {local_ip}:{local_port}")
+                        reader, writer = await asyncio.open_connection(local_ip, local_port)
+                        channel_map[channel_id] = (reader, writer)
+                        
+                        # 启动从本地到WebSocket的转发任务
+                        asyncio.create_task(forward_local_to_ws(reader, ws, channel_id))
+                    except Exception as e:
+                        print(f"[重连失败] 无法连接到 {local_ip}:{local_port}: {e}")
+                        continue
+                else:
+                    print(f"[错误] 收到未知通道 {channel_id} 的数据")
+                    continue
 
-                asyncio.create_task(forward_local_to_ws(reader, ws, channel_id))
-
-            _, writer = channel_map[channel_id]
+            reader, writer = channel_map[channel_id]
             writer.write(payload)
             await writer.drain()
 
         elif type_ == "close":
             if channel_id in channel_map:
-                _, writer = channel_map[channel_id]
+                reader, writer = channel_map[channel_id]
                 writer.close()
                 del channel_map[channel_id]
+                print(f"[关闭] 通道 {channel_id}")
 
 async def forward_local_to_ws(reader, ws, channel_id):
     try:
@@ -95,8 +133,9 @@ async def forward_local_to_ws(reader, ws, channel_id):
             "type": "close"
         }))
         if channel_id in channel_map:
-            _, writer = channel_map[channel_id]
+            reader, writer = channel_map[channel_id]
             writer.close()
             del channel_map[channel_id]
+            print(f"[关闭] 通道 {channel_id}")
 
 asyncio.run(handle_client())

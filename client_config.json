@@ -1,16 +1,11 @@
 {
-    "server": "ws://your-public-server-ip:8765",
+    "server": "ws://127.0.0.1:8765",
     "client_id": "client-a1",
     "mappings": [
       {
         "local_ip": "127.0.0.1",
         "local_port": 3000,
-        "remote_port": 8080
-      },
-      {
-        "local_ip": "192.168.1.10",
-        "local_port": 8081,
-        "remote_port": 8081
+        "remote_port": 3001
       }
     ]
   }
