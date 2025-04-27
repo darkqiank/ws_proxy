@@ -1,48 +1,87 @@
 # server.py
 import asyncio
 import websockets
-import uuid
 import json
 import base64
+from collections import defaultdict
+from pathlib import Path
 
-clients = set()
-channels = {}
+# ======== 加载配置文件 =========
+CONFIG_PATH = "server_config.json"
 
-async def ws_handler(websocket):
-    print("客户端A已连接")
-    clients.add(websocket)
+if not Path(CONFIG_PATH).exists():
+    print(f"[错误] 未找到配置文件：{CONFIG_PATH}")
+    exit(1)
 
+with open(CONFIG_PATH, "r") as f:
+    config = json.load(f)
+
+WS_HOST = config.get("websocket_host", "0.0.0.0")
+WS_PORT = config.get("websocket_port", 8765)
+# =================================
+
+client_connections = {}  # client_id => websocket
+port_client_map = {}     # remote_port => client_id
+channels = {}            # channel_id => (writer, websocket)
+
+async def register_client(websocket):
+    try:
+        msg = await websocket.recv()
+        reg = json.loads(msg)
+        client_id = reg["client_id"]
+        mappings = reg["mappings"]
+
+        client_connections[client_id] = websocket
+        for m in mappings:
+            port_client_map[m["remote_port"]] = client_id
+
+            async def handler(reader, writer, remote_port=m["remote_port"]):
+                await handle_tcp_connection(remote_port, reader, writer)
+
+            asyncio.create_task(asyncio.start_server(handler, WS_HOST, m["remote_port"]))
+            print(f"[注册] client_id={client_id}, 映射公网端口 {m['remote_port']} -> 本地端口 {m['local_port']}")
+
+        await listen_from_client(websocket, client_id)
+
+    except Exception as e:
+        print(f"[注册失败] {e}")
+
+async def listen_from_client(websocket, client_id):
     try:
         async for msg in websocket:
-            try:
-                data = json.loads(msg)
-                channel_id = data["channel"]
-                type_ = data["type"]
+            data = json.loads(msg)
+            channel_id = data["channel"]
+            type_ = data["type"]
 
-                if type_ == "data":
-                    payload = base64.b64decode(data["payload"])
-                    if channel_id in channels:
-                        channels[channel_id].write(payload)
-                        await channels[channel_id].drain()
-                elif type_ == "close":
-                    if channel_id in channels:
-                        channels[channel_id].close()
-                        del channels[channel_id]
-            except Exception as e:
-                print(f"处理消息失败：{e}")
+            if type_ == "data":
+                payload = base64.b64decode(data["payload"])
+                if channel_id in channels:
+                    writer, _ = channels[channel_id]
+                    writer.write(payload)
+                    await writer.drain()
 
+            elif type_ == "close":
+                if channel_id in channels:
+                    writer, _ = channels[channel_id]
+                    writer.close()
+                    del channels[channel_id]
+
+    except Exception as e:
+        print(f"[{client_id}] 通信错误: {e}")
     finally:
-        clients.remove(websocket)
+        print(f"[{client_id}] 连接断开")
+        client_connections.pop(client_id, None)
 
-async def tcp_handler(reader, writer):
-    if not clients:
-        print("没有可用的A端连接")
+async def handle_tcp_connection(remote_port, reader, writer):
+    client_id = port_client_map.get(remote_port)
+    websocket = client_connections.get(client_id)
+    if not websocket:
+        print(f"[错误] 没有客户端可用 for 端口 {remote_port}")
         writer.close()
         return
 
-    websocket = list(clients)[0]
-    channel_id = str(uuid.uuid4())
-    channels[channel_id] = writer
+    channel_id = f"{client_id}:{id(writer)}"
+    channels[channel_id] = (writer, websocket)
 
     async def tcp_to_ws():
         try:
@@ -55,24 +94,21 @@ async def tcp_handler(reader, writer):
                     "type": "data",
                     "payload": base64.b64encode(data).decode()
                 }))
-        except Exception as e:
-            print(f"转发失败: {e}")
+        except:
+            pass
         finally:
             await websocket.send(json.dumps({
                 "channel": channel_id,
                 "type": "close"
             }))
+            channels.pop(channel_id, None)
+            writer.close()
 
-    await tcp_to_ws()
-    if channel_id in channels:
-        del channels[channel_id]
-    writer.close()
+    asyncio.create_task(tcp_to_ws())
 
 async def main():
-    ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8765)
-    tcp_server = await asyncio.start_server(tcp_handler, "0.0.0.0", 8080)
-    print("服务运行中：WS端口8765，对外转发端口8080")
-    async with ws_server, tcp_server:
-        await asyncio.gather(ws_server.wait_closed(), tcp_server.serve_forever())
+    print(f"[启动服务] WebSocket监听 {WS_HOST}:{WS_PORT}")
+    async with websockets.serve(register_client, WS_HOST, WS_PORT):
+        await asyncio.Future()  # run forever
 
 asyncio.run(main())
