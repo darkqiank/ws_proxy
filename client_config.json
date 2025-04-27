@@ -1,5 +1,5 @@
 {
-    "server": "ws://127.0.0.1:8765",
+    "server": "wss://127.0.0.1:8765",
     "client_id": "client-a1",
     "mappings": [
       {
@@ -7,6 +7,13 @@
         "local_port": 3000,
         "remote_port": 3001
       }
-    ]
-  }
+    ],
+    "verify_ssl": false,
+    "ca_cert": ".ssl/server_cert.pem",
+    "client_cert": ".ssl/client_cert.pem",
+    "client_key": ".ssl/client_key.pem",
+    "reconnect_delay_min": 1,
+    "reconnect_delay_max": 30,
+    "reconnect_factor": 1.5
+}
   
