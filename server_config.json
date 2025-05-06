@@ -1,8 +1,0 @@
-{
-    "websocket_host": "0.0.0.0",
-    "websocket_port": 8765,
-    "use_ssl": true,
-    "ssl_cert": ".ssl/server_cert.pem",
-    "ssl_key": ".ssl/server_key.pem"
-}
-  
