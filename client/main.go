@@ -136,33 +136,9 @@ func runClient(ctx context.Context) error {
 	}
 
 	// 注册所有代理
-	for i, proxyConfig := range config.Proxies {
-		// 第一个代理直接发送，其他的重新认证并发送
-		if i == 0 {
-			if err = registerProxy(controlConn, proxyConfig, false); err != nil {
-				return fmt.Errorf("注册代理 %s 失败: %v", proxyConfig.Name, err)
-			}
-		} else {
-			// 建立新连接
-			proxyConn, err := net.Dial("tcp", address)
-			if err != nil {
-				return fmt.Errorf("连接服务端失败: %v", err)
-			}
-
-			// 认证
-			if err = authenticate(proxyConn); err != nil {
-				proxyConn.Close()
-				return fmt.Errorf("认证失败: %v", err)
-			}
-
-			// 注册代理
-			if err = registerProxy(proxyConn, proxyConfig, true); err != nil {
-				proxyConn.Close()
-				return fmt.Errorf("注册代理 %s 失败: %v", proxyConfig.Name, err)
-			}
-
-			// 关闭连接，使用控制连接接管
-			proxyConn.Close()
+	for _, proxyConfig := range config.Proxies {
+		if err = registerProxy(controlConn, proxyConfig); err != nil {
+			return fmt.Errorf("注册代理 %s 失败: %v", proxyConfig.Name, err)
 		}
 	}
 
@@ -233,7 +209,7 @@ func authenticate(conn net.Conn) error {
 }
 
 // 注册代理
-func registerProxy(conn net.Conn, proxyConfig common.ProxyConfig, isNewConn bool) error {
+func registerProxy(conn net.Conn, proxyConfig common.ProxyConfig) error {
 	// 发送新建代理请求
 	proxyReq := common.NewProxyRequest{
 		Name:       proxyConfig.Name,
@@ -247,11 +223,6 @@ func registerProxy(conn net.Conn, proxyConfig common.ProxyConfig, isNewConn bool
 
 	if err := common.WriteMessage(conn, common.MsgTypeNewProxy, reqData); err != nil {
 		return fmt.Errorf("发送代理请求失败: %v", err)
-	}
-
-	// 如果是新连接，不需要等待响应
-	if isNewConn {
-		return nil
 	}
 
 	// 接收新建代理响应
