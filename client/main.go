@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,6 +24,9 @@ var (
 	// 全局配置
 	config *common.ClientConfig
 
+	// 客户端ID
+	clientID string
+
 	// 工作连接管理
 	controlConn net.Conn
 	workConnCh  = make(map[string]chan net.Conn)
@@ -31,6 +36,13 @@ var (
 	reconnectCh = make(chan struct{})
 	exitCh      = make(chan struct{})
 )
+
+// 生成随机客户端ID
+func generateClientID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 func main() {
 	// 解析命令行参数
@@ -44,6 +56,10 @@ func main() {
 		return
 	}
 	common.Info("加载配置成功")
+
+	// 生成客户端ID
+	clientID = generateClientID()
+	common.Info("客户端ID: %s", clientID)
 
 	// 初始化通道
 	for _, proxyConfig := range config.Proxies {
@@ -115,14 +131,38 @@ func runClient(ctx context.Context) error {
 	common.Info("已连接到服务端: %s", address)
 
 	// 客户端认证
-	if err = authenticate(); err != nil {
+	if err = authenticate(controlConn); err != nil {
 		return fmt.Errorf("认证失败: %v", err)
 	}
 
 	// 注册所有代理
-	for _, proxyConfig := range config.Proxies {
-		if err = registerProxy(proxyConfig); err != nil {
-			return fmt.Errorf("注册代理 %s 失败: %v", proxyConfig.Name, err)
+	for i, proxyConfig := range config.Proxies {
+		// 第一个代理直接发送，其他的重新认证并发送
+		if i == 0 {
+			if err = registerProxy(controlConn, proxyConfig, false); err != nil {
+				return fmt.Errorf("注册代理 %s 失败: %v", proxyConfig.Name, err)
+			}
+		} else {
+			// 建立新连接
+			proxyConn, err := net.Dial("tcp", address)
+			if err != nil {
+				return fmt.Errorf("连接服务端失败: %v", err)
+			}
+
+			// 认证
+			if err = authenticate(proxyConn); err != nil {
+				proxyConn.Close()
+				return fmt.Errorf("认证失败: %v", err)
+			}
+
+			// 注册代理
+			if err = registerProxy(proxyConn, proxyConfig, true); err != nil {
+				proxyConn.Close()
+				return fmt.Errorf("注册代理 %s 失败: %v", proxyConfig.Name, err)
+			}
+
+			// 关闭连接，使用控制连接接管
+			proxyConn.Close()
 		}
 	}
 
@@ -154,22 +194,23 @@ func runClient(ctx context.Context) error {
 }
 
 // 客户端认证
-func authenticate() error {
+func authenticate(conn net.Conn) error {
 	// 发送认证请求
 	authReq := common.AuthRequest{
-		Token: config.Token,
+		Token:    config.Token,
+		ClientID: clientID,
 	}
 	reqData, err := json.Marshal(authReq)
 	if err != nil {
 		return fmt.Errorf("序列化认证请求失败: %v", err)
 	}
 
-	if err := common.WriteMessage(controlConn, common.MsgTypeAuth, reqData); err != nil {
+	if err := common.WriteMessage(conn, common.MsgTypeAuth, reqData); err != nil {
 		return fmt.Errorf("发送认证请求失败: %v", err)
 	}
 
 	// 接收认证响应
-	msg, err := common.ReadMessage(controlConn)
+	msg, err := common.ReadMessage(conn)
 	if err != nil {
 		return fmt.Errorf("读取认证响应失败: %v", err)
 	}
@@ -192,23 +233,29 @@ func authenticate() error {
 }
 
 // 注册代理
-func registerProxy(proxyConfig common.ProxyConfig) error {
+func registerProxy(conn net.Conn, proxyConfig common.ProxyConfig, isNewConn bool) error {
 	// 发送新建代理请求
 	proxyReq := common.NewProxyRequest{
 		Name:       proxyConfig.Name,
 		RemotePort: proxyConfig.RemotePort,
+		ClientID:   clientID,
 	}
 	reqData, err := json.Marshal(proxyReq)
 	if err != nil {
 		return fmt.Errorf("序列化代理请求失败: %v", err)
 	}
 
-	if err := common.WriteMessage(controlConn, common.MsgTypeNewProxy, reqData); err != nil {
+	if err := common.WriteMessage(conn, common.MsgTypeNewProxy, reqData); err != nil {
 		return fmt.Errorf("发送代理请求失败: %v", err)
 	}
 
+	// 如果是新连接，不需要等待响应
+	if isNewConn {
+		return nil
+	}
+
 	// 接收新建代理响应
-	msg, err := common.ReadMessage(controlConn)
+	msg, err := common.ReadMessage(conn)
 	if err != nil {
 		return fmt.Errorf("读取代理响应失败: %v", err)
 	}
@@ -339,7 +386,7 @@ func createWorkConn(proxyName string) (net.Conn, error) {
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// 认证
-	if err = doAuthForConn(conn); err != nil {
+	if err = authenticate(conn); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("工作连接认证失败: %v", err)
 	}
@@ -347,6 +394,7 @@ func createWorkConn(proxyName string) (net.Conn, error) {
 	// 发送新工作连接请求
 	workConnReq := common.NewWorkConnRequest{
 		ProxyName: proxyName,
+		ClientID:  clientID,
 	}
 	reqData, err := json.Marshal(workConnReq)
 	if err != nil {
@@ -363,43 +411,6 @@ func createWorkConn(proxyName string) (net.Conn, error) {
 	conn.SetDeadline(time.Time{})
 
 	return conn, nil
-}
-
-// 为工作连接进行认证
-func doAuthForConn(conn net.Conn) error {
-	// 发送认证请求
-	authReq := common.AuthRequest{
-		Token: config.Token,
-	}
-	reqData, err := json.Marshal(authReq)
-	if err != nil {
-		return fmt.Errorf("序列化认证请求失败: %v", err)
-	}
-
-	if err := common.WriteMessage(conn, common.MsgTypeAuth, reqData); err != nil {
-		return fmt.Errorf("发送认证请求失败: %v", err)
-	}
-
-	// 接收认证响应
-	msg, err := common.ReadMessage(conn)
-	if err != nil {
-		return fmt.Errorf("读取认证响应失败: %v", err)
-	}
-
-	if msg.Type != common.MsgTypeAuthResp {
-		return fmt.Errorf("预期认证响应，收到类型: %d", msg.Type)
-	}
-
-	var authResp common.AuthResponse
-	if err := json.Unmarshal(msg.Content, &authResp); err != nil {
-		return fmt.Errorf("解析认证响应失败: %v", err)
-	}
-
-	if !authResp.Success {
-		return fmt.Errorf("认证失败: %s", authResp.Error)
-	}
-
-	return nil
 }
 
 // 获取本地连接

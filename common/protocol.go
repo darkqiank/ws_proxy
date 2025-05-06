@@ -9,11 +9,11 @@ import (
 
 // 消息类型
 const (
-	MsgTypeAuth        = iota // 认证消息
-	MsgTypeAuthResp           // 认证响应
-	MsgTypeNewProxy           // 新建代理
-	MsgTypeNewProxyResp       // 新建代理响应
-	MsgTypeNewWorkConn        // 新工作连接
+	MsgTypeAuth         = iota // 认证消息
+	MsgTypeAuthResp            // 认证响应
+	MsgTypeNewProxy            // 新建代理
+	MsgTypeNewProxyResp        // 新建代理响应
+	MsgTypeNewWorkConn         // 新工作连接
 )
 
 // 协议错误定义
@@ -81,7 +81,8 @@ func ReadMessage(conn net.Conn) (*Message, error) {
 
 // AuthRequest 认证请求
 type AuthRequest struct {
-	Token string `json:"token"`
+	Token    string `json:"token"`
+	ClientID string `json:"client_id"` // 客户端唯一标识
 }
 
 // AuthResponse 认证响应
@@ -94,6 +95,7 @@ type AuthResponse struct {
 type NewProxyRequest struct {
 	Name       string `json:"name"`
 	RemotePort int    `json:"remote_port"`
+	ClientID   string `json:"client_id"` // 客户端唯一标识
 }
 
 // NewProxyResponse 新建代理响应
@@ -105,6 +107,7 @@ type NewProxyResponse struct {
 // NewWorkConnRequest 新工作连接请求
 type NewWorkConnRequest struct {
 	ProxyName string `json:"proxy_name"`
+	ClientID  string `json:"client_id"` // 客户端唯一标识
 }
 
 // CopyBuffer 在两个连接之间复制数据
@@ -125,4 +128,4 @@ func Transfer(c1, c2 net.Conn) {
 	CopyBuffer(c2, c1)
 	c1.Close()
 	c2.Close()
-} 
+}

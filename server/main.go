@@ -24,7 +24,11 @@ var (
 
 	// 客户端管理
 	clientMutex sync.Mutex
-	clients     = make(map[string][]*Proxy) // 客户端地址 -> 代理列表
+	clients     = make(map[string][]*Proxy) // 客户端ID -> 代理列表
+
+	// 控制连接映射
+	controlsMutex sync.Mutex
+	controlConns  = make(map[string]net.Conn) // 客户端ID -> 控制连接
 )
 
 // Proxy 代理信息
@@ -33,7 +37,7 @@ type Proxy struct {
 	RemotePort   int
 	Listener     net.Listener
 	Conns        chan net.Conn
-	ClientAddr   string        // 关联的客户端地址
+	ClientID     string        // 关联的客户端ID
 	LastActivity time.Time     // 最后活动时间
 	Done         chan struct{} // 关闭信号
 }
@@ -70,59 +74,215 @@ func main() {
 			continue
 		}
 
-		go handleControlConnection(conn)
+		go handleConnection(conn)
+	}
+}
+
+// 处理新连接
+func handleConnection(conn net.Conn) {
+	// 读取第一条消息确定连接类型
+	msg, err := common.ReadMessage(conn)
+	if err != nil {
+		common.Error("读取初始消息失败: %v", err)
+		conn.Close()
+		return
+	}
+
+	// 只接受认证类型的消息作为初始消息
+	if msg.Type != common.MsgTypeAuth {
+		common.Error("初始消息不是认证类型: %d", msg.Type)
+		conn.Close()
+		return
+	}
+
+	// 解析认证请求
+	var authReq common.AuthRequest
+	if err := json.Unmarshal(msg.Content, &authReq); err != nil {
+		common.Error("解析认证消息失败: %v", err)
+		conn.Close()
+		return
+	}
+
+	// 获取客户端ID
+	clientID := authReq.ClientID
+	if clientID == "" {
+		common.Error("客户端未提供ID")
+		conn.Close()
+		return
+	}
+
+	// 验证Token
+	var authResp common.AuthResponse
+	if authReq.Token == config.Token {
+		authResp.Success = true
+	} else {
+		authResp.Success = false
+		authResp.Error = "invalid token"
+		common.Error("客户端认证失败: %s (IP: %s)", clientID, conn.RemoteAddr().String())
+
+		// 发送认证失败响应并关闭连接
+		respData, _ := json.Marshal(authResp)
+		common.WriteMessage(conn, common.MsgTypeAuthResp, respData)
+		conn.Close()
+		return
+	}
+
+	// 发送认证成功响应
+	respData, err := json.Marshal(authResp)
+	if err != nil {
+		common.Error("序列化认证响应失败: %v", err)
+		conn.Close()
+		return
+	}
+
+	if err := common.WriteMessage(conn, common.MsgTypeAuthResp, respData); err != nil {
+		common.Error("发送认证响应失败: %v", err)
+		conn.Close()
+		return
+	}
+
+	// 读取下一条消息确定具体操作
+	msg, err = common.ReadMessage(conn)
+	if err != nil {
+		common.Error("读取操作消息失败: %v", err)
+		conn.Close()
+		return
+	}
+
+	switch msg.Type {
+	case common.MsgTypeNewProxy:
+		// 控制连接: 处理代理注册
+		common.Info("客户端认证成功: %s (IP: %s) - 控制连接", clientID, conn.RemoteAddr().String())
+		handleControlConnection(conn, msg, clientID)
+	case common.MsgTypeNewWorkConn:
+		// 工作连接: 处理数据转发
+		common.Info("客户端认证成功: %s (IP: %s) - 工作连接", clientID, conn.RemoteAddr().String())
+		handleWorkConnection(conn, msg, clientID)
+	default:
+		common.Error("未知操作类型: %d", msg.Type)
+		conn.Close()
 	}
 }
 
 // 处理控制连接
-func handleControlConnection(conn net.Conn) {
+func handleControlConnection(conn net.Conn, initialMsg *common.Message, clientID string) {
+	// 注册控制连接
+	controlsMutex.Lock()
+	// 如果已有控制连接，关闭旧连接
+	if oldConn, exists := controlConns[clientID]; exists {
+		common.Info("关闭客户端 %s 的旧控制连接", clientID)
+		oldConn.Close()
+	}
+	controlConns[clientID] = conn
+	controlsMutex.Unlock()
+
+	// 初始化客户端记录
+	clientMutex.Lock()
+	if _, exists := clients[clientID]; !exists {
+		clients[clientID] = []*Proxy{}
+	}
+	clientMutex.Unlock()
+
+	// 先处理初始消息(新建代理请求)
+	handleNewProxy(conn, initialMsg, clientID)
+
+	// 持续监听控制连接的消息
 	defer func() {
 		conn.Close()
-		// 客户端断开时清理相关代理
-		cleanupClientProxies(conn.RemoteAddr().String())
+
+		// 从控制连接映射中移除
+		controlsMutex.Lock()
+		delete(controlConns, clientID)
+		controlsMutex.Unlock()
+
+		// 清理该客户端的所有代理
+		cleanupClientProxies(clientID)
 	}()
 
-	clientAddr := conn.RemoteAddr().String()
-	common.Info("收到新的控制连接: %s", clientAddr)
-
-	// 处理认证
-	if !handleAuth(conn) {
-		return
-	}
-
-	// 处理控制消息
 	for {
 		msg, err := common.ReadMessage(conn)
 		if err != nil {
-			common.Error("读取消息失败: %v", err)
+			common.Error("读取控制消息失败: %v", err)
 			break
 		}
 
 		switch msg.Type {
 		case common.MsgTypeNewProxy:
-			handleNewProxy(conn, msg)
-		case common.MsgTypeNewWorkConn:
-			handleNewWorkConn(conn, msg)
+			handleNewProxy(conn, msg, clientID)
 		default:
-			common.Error("未知消息类型: %d", msg.Type)
+			common.Error("控制连接收到未知类型消息: %d", msg.Type)
 		}
 	}
 }
 
-// 清理客户端关联的代理
-func cleanupClientProxies(clientAddr string) {
-	clientMutex.Lock()
-	proxiesForClient, exists := clients[clientAddr]
-	if exists {
-		delete(clients, clientAddr)
-	}
-	clientMutex.Unlock()
-
-	if !exists {
+// 处理工作连接
+func handleWorkConnection(conn net.Conn, initialMsg *common.Message, clientID string) {
+	// 解析工作连接请求
+	var req common.NewWorkConnRequest
+	if err := json.Unmarshal(initialMsg.Content, &req); err != nil {
+		common.Error("解析工作连接请求失败: %v", err)
+		conn.Close()
 		return
 	}
 
-	common.Info("客户端断开连接，清理相关代理: %s", clientAddr)
+	// 验证请求中的客户端ID
+	if req.ClientID != clientID {
+		common.Error("工作连接请求中的客户端ID不匹配: %s != %s", req.ClientID, clientID)
+		conn.Close()
+		return
+	}
+
+	proxyName := req.ProxyName
+	common.Info("收到新工作连接请求: %s, 客户端: %s", proxyName, clientID)
+
+	// 获取代理
+	proxyMutex.Lock()
+	proxy, exists := proxies[proxyName]
+
+	// 确保工作连接来自正确的客户端
+	if exists && proxy.ClientID != clientID {
+		common.Error("工作连接请求的代理属于其他客户端: %s, 期望: %s", clientID, proxy.ClientID)
+		exists = false
+	}
+	proxyMutex.Unlock()
+
+	if !exists {
+		common.Error("代理不存在或不属于该客户端: %s", proxyName)
+		conn.Close()
+		return
+	}
+
+	// 更新活动时间
+	proxy.LastActivity = time.Now()
+
+	// 等待用户连接
+	common.Info("工作连接等待用户连接: %s", proxyName)
+	userConn, ok := <-proxy.Conns
+	if !ok {
+		common.Error("代理连接通道已关闭: %s", proxyName)
+		conn.Close()
+		return
+	}
+
+	// 数据转发
+	common.Info("开始代理数据传输: %s", proxyName)
+	common.Transfer(conn, userConn)
+}
+
+// 清理客户端关联的代理
+func cleanupClientProxies(clientID string) {
+	clientMutex.Lock()
+	proxiesForClient, exists := clients[clientID]
+	if exists {
+		delete(clients, clientID)
+	}
+	clientMutex.Unlock()
+
+	if !exists || len(proxiesForClient) == 0 {
+		return
+	}
+
+	common.Info("客户端断开连接，清理相关代理: %s", clientID)
 
 	// 关闭该客户端的所有代理
 	for _, proxy := range proxiesForClient {
@@ -152,68 +312,21 @@ func closeProxy(proxy *Proxy) {
 	}
 }
 
-// 处理认证
-func handleAuth(conn net.Conn) bool {
-	msg, err := common.ReadMessage(conn)
-	if err != nil {
-		common.Error("读取认证消息失败: %v", err)
-		return false
-	}
-
-	if msg.Type != common.MsgTypeAuth {
-		common.Error("预期认证消息，收到类型: %d", msg.Type)
-		return false
-	}
-
-	var authReq common.AuthRequest
-	if err := json.Unmarshal(msg.Content, &authReq); err != nil {
-		common.Error("解析认证消息失败: %v", err)
-		return false
-	}
-
-	// 验证Token
-	var authResp common.AuthResponse
-	if authReq.Token == config.Token {
-		authResp.Success = true
-		common.Info("客户端认证成功: %s", conn.RemoteAddr().String())
-	} else {
-		authResp.Success = false
-		authResp.Error = "invalid token"
-		common.Error("客户端认证失败: %s", conn.RemoteAddr().String())
-	}
-
-	// 发送认证响应
-	respData, err := json.Marshal(authResp)
-	if err != nil {
-		common.Error("序列化认证响应失败: %v", err)
-		return false
-	}
-
-	if err := common.WriteMessage(conn, common.MsgTypeAuthResp, respData); err != nil {
-		common.Error("发送认证响应失败: %v", err)
-		return false
-	}
-
-	// 认证成功后初始化客户端记录
-	if authResp.Success {
-		clientMutex.Lock()
-		clients[conn.RemoteAddr().String()] = []*Proxy{}
-		clientMutex.Unlock()
-	}
-
-	return authResp.Success
-}
-
 // 处理新建代理请求
-func handleNewProxy(conn net.Conn, msg *common.Message) {
+func handleNewProxy(conn net.Conn, msg *common.Message, clientID string) {
 	var req common.NewProxyRequest
 	if err := json.Unmarshal(msg.Content, &req); err != nil {
 		common.Error("解析新建代理请求失败: %v", err)
 		return
 	}
 
-	clientAddr := conn.RemoteAddr().String()
-	common.Info("收到新建代理请求: %s, 远程端口: %d, 客户端: %s", req.Name, req.RemotePort, clientAddr)
+	// 验证客户端ID匹配
+	if req.ClientID != clientID {
+		common.Error("代理请求中的客户端ID不匹配: %s != %s", req.ClientID, clientID)
+		return
+	}
+
+	common.Info("收到新建代理请求: %s, 远程端口: %d, 客户端: %s", req.Name, req.RemotePort, clientID)
 
 	var resp common.NewProxyResponse
 	respData, err := func() ([]byte, error) {
@@ -223,7 +336,7 @@ func handleNewProxy(conn net.Conn, msg *common.Message) {
 		// 检查代理是否已存在，如果存在则关闭旧代理
 		if existingProxy, exists := proxies[req.Name]; exists {
 			// 如果是同一个客户端，允许覆盖
-			if existingProxy.ClientAddr == clientAddr {
+			if existingProxy.ClientID == clientID {
 				common.Info("同一客户端重新注册代理: %s", req.Name)
 				closeProxy(existingProxy)
 			} else {
@@ -251,7 +364,7 @@ func handleNewProxy(conn net.Conn, msg *common.Message) {
 			RemotePort:   req.RemotePort,
 			Listener:     listener,
 			Conns:        make(chan net.Conn, 100),
-			ClientAddr:   clientAddr,
+			ClientID:     clientID,
 			LastActivity: time.Now(),
 			Done:         make(chan struct{}),
 		}
@@ -259,7 +372,7 @@ func handleNewProxy(conn net.Conn, msg *common.Message) {
 
 		// 将代理添加到客户端关联列表
 		clientMutex.Lock()
-		clients[clientAddr] = append(clients[clientAddr], proxy)
+		clients[clientID] = append(clients[clientID], proxy)
 		clientMutex.Unlock()
 
 		// 启动代理监听
@@ -321,45 +434,4 @@ func handleProxyConnections(proxy *Proxy) {
 			return
 		}
 	}
-}
-
-// 处理新工作连接请求
-func handleNewWorkConn(conn net.Conn, msg *common.Message) {
-	var req common.NewWorkConnRequest
-	if err := json.Unmarshal(msg.Content, &req); err != nil {
-		common.Error("解析新工作连接请求失败: %v", err)
-		return
-	}
-
-	clientAddr := conn.RemoteAddr().String()
-	common.Info("收到新工作连接请求: %s, 客户端: %s", req.ProxyName, clientAddr)
-
-	proxyMutex.Lock()
-	proxy, exists := proxies[req.ProxyName]
-
-	// 确保工作连接来自正确的客户端
-	if exists && proxy.ClientAddr != clientAddr {
-		common.Error("工作连接请求来自错误的客户端: %s, 期望: %s", clientAddr, proxy.ClientAddr)
-		exists = false
-	}
-	proxyMutex.Unlock()
-
-	if !exists {
-		common.Error("代理不存在或不属于该客户端: %s", req.ProxyName)
-		return
-	}
-
-	// 更新活动时间
-	proxy.LastActivity = time.Now()
-
-	// 等待用户连接
-	userConn, ok := <-proxy.Conns
-	if !ok {
-		common.Error("代理连接通道已关闭: %s", req.ProxyName)
-		return
-	}
-
-	// 数据转发
-	common.Info("开始代理数据传输: %s", req.ProxyName)
-	common.Transfer(conn, userConn)
 }
