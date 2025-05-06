@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gotunnel/common"
@@ -22,6 +26,10 @@ var (
 	controlConn net.Conn
 	workConnCh  = make(map[string]chan net.Conn)
 	workConnMu  sync.Mutex
+
+	// 重连相关
+	reconnectCh = make(chan struct{})
+	exitCh      = make(chan struct{})
 )
 
 func main() {
@@ -42,20 +50,51 @@ func main() {
 		workConnCh[proxyConfig.Name] = make(chan net.Conn, 10)
 	}
 
+	// 设置上下文，用于优雅退出
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 处理信号量
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		common.Info("接收到退出信号，正在关闭...")
+		cancel()
+	}()
+
 	// 启动客户端
+	go startClient(ctx)
+
+	// 等待退出
+	<-ctx.Done()
+	close(exitCh)
+	common.Info("客户端已退出")
+}
+
+// 启动客户端
+func startClient(ctx context.Context) {
 	for {
-		if err := runClient(); err != nil {
-			common.Error("客户端运行出错: %v", err)
-			time.Sleep(5 * time.Second)
-			common.Info("尝试重连...")
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if err := runClient(ctx); err != nil {
+				common.Error("客户端运行出错: %v", err)
+				// 等待一段时间后重连
+				select {
+				case <-time.After(5 * time.Second):
+					common.Info("尝试重连...")
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
-		break
 	}
 }
 
 // 运行客户端
-func runClient() error {
+func runClient(ctx context.Context) error {
 	var err error
 
 	// 连接服务端
@@ -64,7 +103,14 @@ func runClient() error {
 	if err != nil {
 		return fmt.Errorf("连接服务端失败: %v", err)
 	}
-	defer controlConn.Close()
+	defer func() {
+		controlConn.Close()
+		// 通知所有工作连接重新连接
+		select {
+		case reconnectCh <- struct{}{}:
+		default:
+		}
+	}()
 
 	common.Info("已连接到服务端: %s", address)
 
@@ -84,12 +130,27 @@ func runClient() error {
 	var wg sync.WaitGroup
 	for _, proxyConfig := range config.Proxies {
 		wg.Add(1)
-		go startLocalProxy(proxyConfig, &wg)
+		go func(proxyConfig common.ProxyConfig) {
+			defer wg.Done()
+			startLocalProxy(ctx, proxyConfig)
+		}(proxyConfig)
 	}
 
-	// 等待所有代理结束
-	wg.Wait()
-	return nil
+	// 保持连接活跃，检测断开
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			// 简单的心跳检测，可扩展为实际的心跳消息
+			if _, err := controlConn.Write([]byte{0}); err != nil {
+				return fmt.Errorf("心跳检测失败: %v", err)
+			}
+		}
+	}
 }
 
 // 客户端认证
@@ -170,41 +231,99 @@ func registerProxy(proxyConfig common.ProxyConfig) error {
 }
 
 // 启动本地代理
-func startLocalProxy(proxyConfig common.ProxyConfig, wg *sync.WaitGroup) {
-	defer wg.Done()
-
+func startLocalProxy(ctx context.Context, proxyConfig common.ProxyConfig) {
 	// 启动多个工作连接
 	const workConnCount = 5
 	var workWg sync.WaitGroup
+	var stopCh = make(chan struct{})
+
+	// 启动工作连接管理器
 	for i := 0; i < workConnCount; i++ {
 		workWg.Add(1)
 		go func() {
 			defer workWg.Done()
-			for {
-				// 创建新工作连接
-				workConn, err := createWorkConn(proxyConfig.Name)
-				if err != nil {
-					common.Error("创建工作连接失败: %v", err)
-					time.Sleep(5 * time.Second)
-					continue
-				}
-
-				// 获取本地连接
-				localConn, err := getLocalConnection(proxyConfig)
-				if err != nil {
-					common.Error("获取本地连接失败: %v", err)
-					workConn.Close()
-					continue
-				}
-
-				// 转发数据
-				common.Info("开始代理数据传输: %s", proxyConfig.Name)
-				common.Transfer(workConn, localConn)
-			}
+			startWorkConn(ctx, stopCh, proxyConfig)
 		}()
 	}
 
+	// 等待停止信号
+	select {
+	case <-ctx.Done():
+		// 主动关闭
+	case <-exitCh:
+		// 程序退出
+	}
+
+	// 通知所有工作连接停止
+	close(stopCh)
+	// 等待所有工作连接退出
 	workWg.Wait()
+}
+
+// 启动工作连接
+func startWorkConn(ctx context.Context, stopCh chan struct{}, proxyConfig common.ProxyConfig) {
+	retryDelay := 1 * time.Second
+	maxRetryDelay := 30 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		case <-reconnectCh:
+			// 控制连接断开，需要等待重新建立
+			time.Sleep(time.Second)
+			continue
+		default:
+			// 创建并管理工作连接
+			if err := handleWorkConn(proxyConfig); err != nil {
+				common.Error("工作连接处理错误: %v, 将在 %v 后重试", err, retryDelay)
+
+				// 退避重试
+				select {
+				case <-time.After(retryDelay):
+					// 指数退避增加重试延迟，但不超过最大值
+					retryDelay = time.Duration(float64(retryDelay) * 1.5)
+					if retryDelay > maxRetryDelay {
+						retryDelay = maxRetryDelay
+					}
+				case <-ctx.Done():
+					return
+				case <-stopCh:
+					return
+				case <-reconnectCh:
+					// 如果收到重连信号，重置重试延迟
+					retryDelay = 1 * time.Second
+				}
+			} else {
+				// 成功处理了一个连接，重置重试延迟
+				retryDelay = 1 * time.Second
+			}
+		}
+	}
+}
+
+// 处理单个工作连接
+func handleWorkConn(proxyConfig common.ProxyConfig) error {
+	// 创建新工作连接
+	workConn, err := createWorkConn(proxyConfig.Name)
+	if err != nil {
+		return fmt.Errorf("创建工作连接失败: %v", err)
+	}
+	defer workConn.Close()
+
+	// 获取本地连接
+	localConn, err := getLocalConnection(proxyConfig)
+	if err != nil {
+		return fmt.Errorf("获取本地连接失败: %v", err)
+	}
+	defer localConn.Close()
+
+	// 转发数据
+	common.Info("开始代理数据传输: %s", proxyConfig.Name)
+	common.Transfer(workConn, localConn)
+	return nil
 }
 
 // 创建工作连接
@@ -215,6 +334,9 @@ func createWorkConn(proxyName string) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("连接服务端失败: %v", err)
 	}
+
+	// 设置读写超时
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// 认证
 	if err = doAuthForConn(conn); err != nil {
@@ -236,6 +358,9 @@ func createWorkConn(proxyName string) (net.Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("发送工作连接请求失败: %v", err)
 	}
+
+	// 清除读写超时
+	conn.SetDeadline(time.Time{})
 
 	return conn, nil
 }
@@ -280,7 +405,13 @@ func doAuthForConn(conn net.Conn) error {
 // 获取本地连接
 func getLocalConnection(proxyConfig common.ProxyConfig) (net.Conn, error) {
 	localAddr := fmt.Sprintf("%s:%d", proxyConfig.LocalAddr, proxyConfig.LocalPort)
-	conn, err := net.Dial("tcp", localAddr)
+
+	// 设置连接超时
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+
+	conn, err := dialer.Dial("tcp", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("连接本地服务失败: %v", err)
 	}
