@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -115,7 +117,13 @@ func runClient(ctx context.Context) error {
 
 	// 连接服务端
 	address := fmt.Sprintf("%s:%d", config.ServerAddr, config.ServerPort)
-	controlConn, err = net.Dial("tcp", address)
+
+	// 设置连接超时
+	dialer := &net.Dialer{
+		Timeout: common.DialTimeout,
+	}
+
+	controlConn, err = dialer.Dial("tcp", address)
 	if err != nil {
 		return fmt.Errorf("连接服务端失败: %v", err)
 	}
@@ -152,18 +160,38 @@ func runClient(ctx context.Context) error {
 		}(proxyConfig)
 	}
 
-	// 保持连接活跃，检测断开
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	// 创建一个通道用于停止心跳
+	heartbeatStopCh := make(chan struct{})
+	defer close(heartbeatStopCh)
 
+	// 启动心跳检测
+	go common.StartHeartbeat(controlConn, heartbeatStopCh)
+
+	// 监听控制连接消息
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			// 简单的心跳检测，可扩展为实际的心跳消息
-			if _, err := controlConn.Write([]byte{0}); err != nil {
-				return fmt.Errorf("心跳检测失败: %v", err)
+		default:
+			msg, err := common.ReadMessageWithTimeout(controlConn, common.HeartbeatTimeout)
+			if err != nil {
+				// 如果是超时或EOF，表示连接已断开
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					return fmt.Errorf("控制连接读取超时")
+				}
+				if err == io.EOF {
+					return fmt.Errorf("控制连接断开")
+				}
+				return fmt.Errorf("控制连接读取错误: %v", err)
+			}
+
+			// 处理来自服务端的消息
+			switch msg.Type {
+			case common.MsgTypeHeartbeat, common.MsgTypeHeartbeatAck:
+				// 心跳消息由心跳处理协程处理
+				continue
+			default:
+				common.Error("收到未知类型的控制消息: %d", msg.Type)
 			}
 		}
 	}
@@ -250,19 +278,20 @@ func registerProxy(conn net.Conn, proxyConfig common.ProxyConfig) error {
 
 // 启动本地代理
 func startLocalProxy(ctx context.Context, proxyConfig common.ProxyConfig) {
-	// 启动多个工作连接
-	const workConnCount = 5
-	var workWg sync.WaitGroup
-	var stopCh = make(chan struct{})
+	// 创建工作连接管理器
+	connManager := &WorkConnManager{
+		minConns:     2,  // 最小连接数
+		maxConns:     10, // 最大连接数
+		initConns:    5,  // 初始连接数
+		proxyConfig:  proxyConfig,
+		ctx:          ctx,
+		stopCh:       make(chan struct{}),
+		activeConns:  0,
+		connRequests: 0,
+	}
 
 	// 启动工作连接管理器
-	for i := 0; i < workConnCount; i++ {
-		workWg.Add(1)
-		go func() {
-			defer workWg.Done()
-			startWorkConn(ctx, stopCh, proxyConfig)
-		}()
-	}
+	connManager.start()
 
 	// 等待停止信号
 	select {
@@ -272,30 +301,87 @@ func startLocalProxy(ctx context.Context, proxyConfig common.ProxyConfig) {
 		// 程序退出
 	}
 
-	// 通知所有工作连接停止
-	close(stopCh)
-	// 等待所有工作连接退出
-	workWg.Wait()
+	// 停止连接管理器
+	connManager.stop()
 }
 
-// 启动工作连接
-func startWorkConn(ctx context.Context, stopCh chan struct{}, proxyConfig common.ProxyConfig) {
+// WorkConnManager 工作连接管理器
+type WorkConnManager struct {
+	minConns     int
+	maxConns     int
+	initConns    int
+	currentConns int
+	activeConns  int32
+	connRequests int32
+	mu           sync.Mutex
+	proxyConfig  common.ProxyConfig
+	ctx          context.Context
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+}
+
+// start 启动连接管理器
+func (m *WorkConnManager) start() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 初始化连接池
+	for i := 0; i < m.initConns; i++ {
+		m.wg.Add(1)
+		go m.runWorkConn()
+	}
+
+	// 启动动态调整线程
+	go m.monitorAndAdjust()
+}
+
+// stop 停止连接管理器
+func (m *WorkConnManager) stop() {
+	close(m.stopCh)
+	m.wg.Wait()
+}
+
+// runWorkConn 运行单个工作连接处理协程
+func (m *WorkConnManager) runWorkConn() {
+	defer m.wg.Done()
+
 	retryDelay := 1 * time.Second
 	maxRetryDelay := 30 * time.Second
 
+	m.mu.Lock()
+	m.currentConns++
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		m.currentConns--
+		m.mu.Unlock()
+	}()
+
 	for {
 		select {
-		case <-ctx.Done():
+		case <-m.ctx.Done():
 			return
-		case <-stopCh:
+		case <-m.stopCh:
 			return
 		case <-reconnectCh:
-			// 控制连接断开，需要等待重新建立
+			// 控制连接断开，等待重新建立
 			time.Sleep(time.Second)
 			continue
 		default:
+			// 记录连接请求
+			atomic.AddInt32(&m.connRequests, 1)
+
 			// 创建并管理工作连接
-			if err := handleWorkConn(proxyConfig); err != nil {
+			err := handleWorkConn(m.proxyConfig)
+
+			// 如果连接处理成功，记录活跃连接
+			if err == nil {
+				atomic.AddInt32(&m.activeConns, 1)
+			}
+
+			// 如果出现错误，进行重试
+			if err != nil {
 				common.Error("工作连接处理错误: %v, 将在 %v 后重试", err, retryDelay)
 
 				// 退避重试
@@ -306,9 +392,9 @@ func startWorkConn(ctx context.Context, stopCh chan struct{}, proxyConfig common
 					if retryDelay > maxRetryDelay {
 						retryDelay = maxRetryDelay
 					}
-				case <-ctx.Done():
+				case <-m.ctx.Done():
 					return
-				case <-stopCh:
+				case <-m.stopCh:
 					return
 				case <-reconnectCh:
 					// 如果收到重连信号，重置重试延迟
@@ -317,8 +403,61 @@ func startWorkConn(ctx context.Context, stopCh chan struct{}, proxyConfig common
 			} else {
 				// 成功处理了一个连接，重置重试延迟
 				retryDelay = 1 * time.Second
+
+				// 减少活跃连接计数
+				atomic.AddInt32(&m.activeConns, -1)
 			}
 		}
+	}
+}
+
+// monitorAndAdjust 监控并动态调整工作连接数量
+func (m *WorkConnManager) monitorAndAdjust() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.adjustConnCount()
+		case <-m.ctx.Done():
+			return
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+// adjustConnCount 根据负载动态调整连接数量
+func (m *WorkConnManager) adjustConnCount() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 获取当前活跃连接数和请求数
+	activeConns := atomic.LoadInt32(&m.activeConns)
+	requests := atomic.LoadInt32(&m.connRequests)
+
+	// 重置请求计数
+	atomic.StoreInt32(&m.connRequests, 0)
+
+	// 计算负载率
+	loadFactor := float64(activeConns) / float64(m.currentConns)
+	requestRate := float64(requests) / 10.0 // 10秒内的请求率
+
+	// 根据负载动态调整连接数
+	if (loadFactor > 0.7 || requestRate > float64(m.currentConns)) && m.currentConns < m.maxConns {
+		// 高负载，增加连接
+		newCount := m.currentConns + 1
+		common.Info("增加工作连接数: %d -> %d (负载: %.2f, 请求率: %.2f)",
+			m.currentConns, newCount, loadFactor, requestRate)
+
+		m.wg.Add(1)
+		go m.runWorkConn()
+	} else if loadFactor < 0.3 && requestRate < float64(m.currentConns)/2 && m.currentConns > m.minConns {
+		// 低负载，减少连接
+		common.Info("减少工作连接数: %d -> %d (负载: %.2f, 请求率: %.2f)",
+			m.currentConns, m.currentConns-1, loadFactor, requestRate)
+		// 不需要做什么，等待一个连接自然结束即可
 	}
 }
 
@@ -340,21 +479,34 @@ func handleWorkConn(proxyConfig common.ProxyConfig) error {
 
 	// 转发数据
 	common.Info("开始代理数据传输: %s", proxyConfig.Name)
-	common.Transfer(workConn, localConn)
-	return nil
+	errCh := common.Transfer(workConn, localConn)
+
+	// 等待数据传输完成或出错
+	err = <-errCh
+	if err != nil {
+		common.Error("数据传输错误: %s, %v", proxyConfig.Name, err)
+	}
+
+	return err
 }
 
 // 创建工作连接
 func createWorkConn(proxyName string) (net.Conn, error) {
 	// 连接服务端
 	address := fmt.Sprintf("%s:%d", config.ServerAddr, config.ServerPort)
-	conn, err := net.Dial("tcp", address)
+
+	// 设置连接超时
+	dialer := &net.Dialer{
+		Timeout: common.DialTimeout,
+	}
+
+	conn, err := dialer.Dial("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("连接服务端失败: %v", err)
 	}
 
 	// 设置读写超时
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(common.HandshakeTimeout))
 
 	// 认证
 	if err = authenticate(conn); err != nil {

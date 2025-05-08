@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gotunnel/common"
@@ -29,6 +34,9 @@ var (
 	// 控制连接映射
 	controlsMutex sync.Mutex
 	controlConns  = make(map[string]net.Conn) // 客户端ID -> 控制连接
+
+	// 服务关闭信号
+	shutdownCh = make(chan struct{})
 )
 
 // Proxy 代理信息
@@ -55,6 +63,22 @@ func main() {
 	}
 	common.Info("加载配置成功")
 
+	// 创建上下文
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 设置信号处理
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		common.Info("接收到关闭信号")
+		cancel()
+	}()
+
+	// 启动代理清理定时器
+	go startProxyCleanupTimer(ctx)
+
 	// 启动控制服务
 	address := fmt.Sprintf("%s:%d", config.BindAddr, config.BindPort)
 	listener, err := net.Listen("tcp", address)
@@ -67,19 +91,96 @@ func main() {
 	common.Info("服务已启动，监听地址: %s", address)
 
 	// 处理连接
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			common.Error("接受连接失败: %v", err)
-			continue
-		}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					common.Error("接受连接失败: %v", err)
+					continue
+				}
+			}
 
-		go handleConnection(conn)
+			go handleConnection(conn)
+		}
+	}()
+
+	// 等待服务关闭
+	<-ctx.Done()
+	common.Info("服务正在关闭...")
+
+	// 通知所有处理协程关闭
+	close(shutdownCh)
+
+	// 关闭所有控制连接
+	controlsMutex.Lock()
+	for _, conn := range controlConns {
+		conn.Close()
+	}
+	controlsMutex.Unlock()
+
+	// 关闭所有代理
+	proxyMutex.Lock()
+	for _, proxy := range proxies {
+		closeProxy(proxy)
+	}
+	proxyMutex.Unlock()
+
+	common.Info("服务已关闭")
+}
+
+// 启动代理清理定时器
+func startProxyCleanupTimer(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cleanupInactiveProxies()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// 清理不活跃的代理
+func cleanupInactiveProxies() {
+	proxyMutex.Lock()
+	defer proxyMutex.Unlock()
+
+	now := time.Now()
+	maxInactiveTime := 30 * time.Minute
+
+	for name, proxy := range proxies {
+		// 如果代理超过30分钟没有活动，则关闭
+		if now.Sub(proxy.LastActivity) > maxInactiveTime {
+			common.Info("清理不活跃代理: %s, 最后活动时间: %v", name, proxy.LastActivity)
+			closeProxy(proxy)
+
+			// 从客户端关联列表中移除
+			clientMutex.Lock()
+			clientProxies := clients[proxy.ClientID]
+			for i, p := range clientProxies {
+				if p.Name == proxy.Name {
+					// 移除该代理
+					clients[proxy.ClientID] = append(clientProxies[:i], clientProxies[i+1:]...)
+					break
+				}
+			}
+			clientMutex.Unlock()
+		}
 	}
 }
 
 // 处理新连接
 func handleConnection(conn net.Conn) {
+	// 设置初始超时，确保连接不会长时间占用资源
+	conn.SetDeadline(time.Now().Add(common.HandshakeTimeout))
+
 	// 读取第一条消息确定连接类型
 	msg, err := common.ReadMessage(conn)
 	if err != nil {
@@ -141,6 +242,9 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
+	// 清除初始超时
+	conn.SetDeadline(time.Time{})
+
 	// 读取下一条消息确定具体操作
 	msg, err = common.ReadMessage(conn)
 	if err != nil {
@@ -186,8 +290,17 @@ func handleControlConnection(conn net.Conn, initialMsg *common.Message, clientID
 	// 先处理初始消息(新建代理请求)
 	handleNewProxy(conn, initialMsg, clientID)
 
+	// 创建一个通道用于停止心跳
+	heartbeatStopCh := make(chan struct{})
+
+	// 启动心跳检测
+	go common.StartHeartbeat(conn, heartbeatStopCh)
+
 	// 持续监听控制连接的消息
 	defer func() {
+		// 停止心跳
+		close(heartbeatStopCh)
+
 		conn.Close()
 
 		// 从控制连接映射中移除
@@ -200,15 +313,33 @@ func handleControlConnection(conn net.Conn, initialMsg *common.Message, clientID
 	}()
 
 	for {
-		msg, err := common.ReadMessage(conn)
+		// 非阻塞检查关闭信号
+		select {
+		case <-shutdownCh:
+			return
+		default:
+		}
+
+		// 读取消息
+		msg, err := common.ReadMessageWithTimeout(conn, common.HeartbeatTimeout)
 		if err != nil {
-			common.Error("读取控制消息失败: %v", err)
+			// 如果是超时或EOF，表示连接已断开
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				common.Error("控制连接读取超时: %s", clientID)
+			} else if err == io.EOF {
+				common.Info("客户端断开连接: %s", clientID)
+			} else {
+				common.Error("读取控制消息失败: %v", err)
+			}
 			break
 		}
 
 		switch msg.Type {
 		case common.MsgTypeNewProxy:
 			handleNewProxy(conn, msg, clientID)
+		case common.MsgTypeHeartbeat, common.MsgTypeHeartbeatAck:
+			// 心跳消息由心跳处理协程处理
+			continue
 		default:
 			common.Error("控制连接收到未知类型消息: %d", msg.Type)
 		}
@@ -257,16 +388,30 @@ func handleWorkConnection(conn net.Conn, initialMsg *common.Message, clientID st
 
 	// 等待用户连接
 	common.Info("工作连接等待用户连接: %s", proxyName)
-	userConn, ok := <-proxy.Conns
-	if !ok {
-		common.Error("代理连接通道已关闭: %s", proxyName)
+
+	select {
+	case userConn, ok := <-proxy.Conns:
+		if !ok {
+			common.Error("代理连接通道已关闭: %s", proxyName)
+			conn.Close()
+			return
+		}
+
+		// 数据转发
+		common.Info("开始代理数据传输: %s", proxyName)
+		errCh := common.Transfer(conn, userConn)
+
+		// 等待数据传输完成或出错
+		err := <-errCh
+		if err != nil {
+			common.Error("数据传输错误: %s, %v", proxyName, err)
+		}
+
+	case <-shutdownCh:
+		// 服务关闭
 		conn.Close()
 		return
 	}
-
-	// 数据转发
-	common.Info("开始代理数据传输: %s", proxyName)
-	common.Transfer(conn, userConn)
 }
 
 // 清理客户端关联的代理
@@ -284,12 +429,18 @@ func cleanupClientProxies(clientID string) {
 
 	common.Info("客户端断开连接，清理相关代理: %s", clientID)
 
-	// 关闭该客户端的所有代理
+	// 使用 WaitGroup 确保所有清理操作完成
+	var wg sync.WaitGroup
 	for _, proxy := range proxiesForClient {
-		proxyMutex.Lock()
-		closeProxy(proxy)
-		proxyMutex.Unlock()
+		wg.Add(1)
+		go func(p *Proxy) {
+			defer wg.Done()
+			proxyMutex.Lock()
+			closeProxy(p)
+			proxyMutex.Unlock()
+		}(proxy)
 	}
+	wg.Wait()
 }
 
 // 关闭代理
@@ -307,6 +458,8 @@ func closeProxy(proxy *Proxy) {
 		}
 		// 发送关闭信号
 		close(proxy.Done)
+		// 关闭连接通道
+		close(proxy.Conns)
 		// 删除代理
 		delete(proxies, name)
 	}
@@ -423,7 +576,17 @@ func handleProxyConnections(proxy *Proxy) {
 			// 收到新连接
 			common.Info("代理 %s 收到新连接: %s", proxy.Name, conn.RemoteAddr().String())
 			proxy.LastActivity = time.Now()
-			proxy.Conns <- conn
+
+			// 尝试将连接发送到工作连接池，如果没有可用的工作连接，则关闭用户连接
+			select {
+			case proxy.Conns <- conn:
+				// 连接已发送到工作连接
+			case <-time.After(10 * time.Second):
+				// 超时，没有可用的工作连接
+				common.Error("代理 %s 没有可用的工作连接，关闭用户连接", proxy.Name)
+				conn.Close()
+			}
+
 		case err := <-connError:
 			// 监听器错误
 			common.Error("代理 %s 监听错误: %v", proxy.Name, err)
@@ -431,6 +594,9 @@ func handleProxyConnections(proxy *Proxy) {
 		case <-proxy.Done:
 			// 收到关闭信号
 			common.Info("代理 %s 收到关闭信号", proxy.Name)
+			return
+		case <-shutdownCh:
+			// 服务关闭
 			return
 		}
 	}
