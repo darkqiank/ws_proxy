@@ -1,19 +1,19 @@
 {
-  "server_addr": "your_server_public_ip",
-  "server_port": 7000,
+  "server_addr": "127.0.0.1",
+  "server_port": 8766,
   "token": "your_secure_token",
   "proxies": [
     {
       "name": "web",
       "local_addr": "127.0.0.1",
-      "local_port": 80,
-      "remote_port": 8080
+      "local_port": 3000,
+      "remote_port": 3001
     },
     {
-      "name": "ssh",
+      "name": "web2",
       "local_addr": "127.0.0.1",
-      "local_port": 22,
-      "remote_port": 2222
+      "local_port": 7421,
+      "remote_port": 7421
     }
   ]
 } 
